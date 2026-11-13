@@ -148,6 +148,13 @@ fun EqualizerScreen(
                     }
 
                     VisualizerCard(onVisualizerPermission)
+
+                    if (EqEngine.diag.isNotBlank()) {
+                        Text(
+                            EqEngine.diag,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
             }
         }

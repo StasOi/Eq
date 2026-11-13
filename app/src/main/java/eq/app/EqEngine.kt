@@ -1,14 +1,20 @@
 package eq.app
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
+import android.media.audiofx.AudioEffect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -50,12 +56,18 @@ object EqEngine {
         private set
     var virtualAvailable by mutableStateOf(false)
         private set
+    var diag by mutableStateOf("")
+        private set
 
     private var controller: EqualizerController? = null
+    private val sessionControllers = LinkedHashMap<Int, EqualizerController>()
     private var prefs: EqPrefs? = null
     private var appContext: Context? = null
     private val handler = Handler(Looper.getMainLooper())
     private var restartAttempts = 0
+    private var sessionReceiver: BroadcastReceiver? = null
+    private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
+    private var sessionReflectionOk = true
 
     private val restartRunnable = Runnable { restartEffects() }
 
@@ -71,19 +83,26 @@ object EqEngine {
         this.appContext = appContext
         val p = EqPrefs(appContext)
         prefs = p
-        val c = EqualizerController()
+        val c = EqualizerController(0)
         c.start()
         controller = c
         if (c.error == null && c.numberOfBands > 0) {
             loadFromPrefs(c)
-            applyToController(c)
+            applyToController(c, enabled)
             ready = true
             if (p.loadVisualizer() && hasAudioPermission()) {
                 setVisualizer(appContext, true)
             }
         }
         registerDeviceCallback(appContext)
-        if (enabled) startService(appContext)
+        registerSessionReceiver(appContext)
+        registerPlaybackCallback(appContext)
+        if (enabled) {
+            startService(appContext)
+            attachToActiveSessions()
+            if (sessionControllers.isNotEmpty()) c.setEnabled(false)
+        }
+        updateDiag()
     }
 
     private fun loadFromPrefs(c: EqualizerController) {
@@ -101,15 +120,22 @@ object EqEngine {
         enabled = p.loadEnabled()
     }
 
-    private fun applyToController(c: EqualizerController) {
+    private fun applyToController(c: EqualizerController, enable: Boolean) {
         for (i in 0 until bands) c.setBandLevel(i, levels[i])
         c.setBoost(boost)
         c.setBassStrength(bass)
         c.setVirtualStrength(virtual)
-        c.setEnabled(enabled)
-        boostAvailable = c.isBoostAvailable()
-        bassAvailable = c.isBassAvailable()
-        virtualAvailable = c.isVirtualAvailable()
+        c.setEnabled(enable)
+        if (c === controller) {
+            boostAvailable = c.isBoostAvailable()
+            bassAvailable = c.isBassAvailable()
+            virtualAvailable = c.isVirtualAvailable()
+        }
+    }
+
+    private fun applyLive(block: (EqualizerController) -> Unit) {
+        controller?.let(block)
+        for (sc in sessionControllers.values) block(sc)
     }
 
     private fun hasAudioPermission(): Boolean {
@@ -138,6 +164,135 @@ object EqEngine {
         am.registerAudioDeviceCallback(callback, handler)
     }
 
+    private fun registerSessionReceiver(context: Context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                if (action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION ||
+                    action == AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION
+                ) {
+                    handleSessionBroadcast(intent)
+                }
+            }
+        }
+        sessionReceiver = receiver
+        val filter = IntentFilter().apply {
+            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+        log("session receiver registered")
+    }
+
+    private fun handleSessionBroadcast(intent: Intent) {
+        val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
+        val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "?"
+        val open = intent.action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION
+        log("broadcast open=$open session=$sessionId pkg=$pkg")
+        if (sessionId <= 0) return
+        if (open) {
+            attachSession(sessionId)
+            if (enabled && sessionControllers.isNotEmpty()) {
+                controller?.setEnabled(false)
+            }
+        } else {
+            detachSession(sessionId)
+            if (enabled && sessionControllers.isEmpty()) {
+                controller?.setEnabled(true)
+            }
+        }
+        updateDiag()
+    }
+
+    private fun attachSession(sessionId: Int) {
+        if (sessionId <= 0 || sessionControllers.containsKey(sessionId)) return
+        val sc = EqualizerController(sessionId)
+        sc.start()
+        if (sc.error != null || sc.numberOfBands <= 0) {
+            log("attach s$sessionId failed err=${sc.error} bands=${sc.numberOfBands}")
+            sc.release()
+            return
+        }
+        sessionControllers[sessionId] = sc
+        applyToController(sc, enabled)
+        log("attached session=$sessionId bands=${sc.numberOfBands}")
+    }
+
+    private fun detachSession(sessionId: Int) {
+        val sc = sessionControllers.remove(sessionId) ?: return
+        sc.release()
+        log("detached session=$sessionId remaining=${sessionControllers.size}")
+    }
+
+    private fun registerPlaybackCallback(context: Context) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val cb = object : AudioManager.AudioPlaybackCallback() {
+            override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+                scanPlaybackConfigs(configs)
+            }
+        }
+        playbackCallback = cb
+        am.registerAudioPlaybackCallback(cb, handler)
+        log("playback callback registered")
+    }
+
+    private fun attachToActiveSessions() {
+        if (!enabled || !sessionReflectionOk) return
+        val am = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        scanPlaybackConfigs(am.activePlaybackConfigurations)
+    }
+
+    private fun scanPlaybackConfigs(configs: List<AudioPlaybackConfiguration>) {
+        if (!enabled || !sessionReflectionOk) return
+        val seen = mutableSetOf<Int>()
+        for (cfg in configs) {
+            val sid = sessionIdOf(cfg) ?: return
+            if (sid > 0) {
+                seen.add(sid)
+                if (!sessionControllers.containsKey(sid)) {
+                    log("scan: new session=$sid")
+                    attachSession(sid)
+                }
+            }
+        }
+        if (seen.isNotEmpty()) {
+            val stale = sessionControllers.keys.filter { it !in seen }
+            for (sid in stale) detachSession(sid)
+            if (stale.isNotEmpty()) {
+                if (sessionControllers.isEmpty() && enabled) {
+                    controller?.setEnabled(true)
+                }
+                updateDiag()
+            }
+        }
+    }
+
+    private fun sessionIdOf(cfg: AudioPlaybackConfiguration): Int? = try {
+        val m = AudioPlaybackConfiguration::class.java.getMethod("getAudioSessionId")
+        m.isAccessible = true
+        m.invoke(cfg) as? Int
+    } catch (t: Throwable) {
+        sessionReflectionOk = false
+        log("getAudioSessionId unavailable: ${t.message}")
+        null
+    }
+
+    private fun updateDiag() {
+        val parts = mutableListOf<String>()
+        controller?.let { parts.add(it.diag) }
+        for ((sid, sc) in sessionControllers) parts.add("s$sid: ${sc.diag}")
+        diag = parts.joinToString(" | ")
+        log("diag: $diag")
+    }
+
+    private fun log(message: String) {
+        Log.d("EqEngine", message)
+    }
+
     private fun scheduleRestart() {
         restartAttempts = 0
         handler.removeCallbacks(restartRunnable)
@@ -162,7 +317,7 @@ object EqEngine {
             range = c.bandLevelRange
             levels = ShortArray(bands) { i -> levels.getOrElse(i) { 0 }.coerceIn(range[0], range[1]) }
         }
-        applyToController(c)
+        applyToController(c, enabled && sessionControllers.isEmpty())
         ready = true
         if (visualizerActive) {
             val ctx = appContext
@@ -177,18 +332,24 @@ object EqEngine {
         if (enabled) {
             appContext?.let { startService(it) }
         }
+        updateDiag()
     }
 
     fun setEnabled(context: Context, value: Boolean) {
         enabled = value
         prefs?.saveEnabled(value)
-        controller?.setEnabled(value)
         val appContext = context.applicationContext
         if (value) {
+            attachToActiveSessions()
+            for (sc in sessionControllers.values) applyToController(sc, true)
+            controller?.let { applyToController(it, sessionControllers.isEmpty()) }
             startService(appContext)
         } else {
+            controller?.setEnabled(false)
+            for (sc in sessionControllers.values) sc.setEnabled(false)
             appContext.stopService(Intent(appContext, EqService::class.java))
         }
+        updateDiag()
     }
 
     fun setBandLevel(band: Int, level: Short) {
@@ -199,25 +360,25 @@ object EqEngine {
             preset = EqPrefs.PRESET_USER
             prefs?.savePreset(EqPrefs.PRESET_USER)
         }
-        controller?.setBandLevel(band, level)
+        applyLive { it.setBandLevel(band, level) }
     }
 
     fun updateBoost(value: Int) {
         boost = value
         prefs?.saveBoost(value)
-        controller?.setBoost(value)
+        applyLive { it.setBoost(value) }
     }
 
     fun updateBass(value: Int) {
         bass = value
         prefs?.saveBass(value)
-        controller?.setBassStrength(value)
+        applyLive { it.setBassStrength(value) }
     }
 
     fun updateVirtual(value: Int) {
         virtual = value
         prefs?.saveVirtual(value)
-        controller?.setVirtualStrength(value)
+        applyLive { it.setVirtualStrength(value) }
     }
 
     fun applyPreset(name: String) {
@@ -228,7 +389,7 @@ object EqEngine {
         val gains = presetGains(name, bands, range)
         levels = gains
         for (i in gains.indices) {
-            controller?.setBandLevel(i, gains[i])
+            applyLive { c -> c.setBandLevel(i, gains[i]) }
             p.saveBandLevel(i, gains[i])
         }
     }

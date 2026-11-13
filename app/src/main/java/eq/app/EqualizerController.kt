@@ -6,7 +6,7 @@ import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.Virtualizer
 import android.media.audiofx.Visualizer
 
-class EqualizerController {
+class EqualizerController(private val sessionId: Int = 0) {
 
     private var equalizer: Equalizer? = null
     private var enhancer: LoudnessEnhancer? = null
@@ -15,6 +15,9 @@ class EqualizerController {
     private var visualizer: Visualizer? = null
 
     var error: String? = null
+        private set
+
+    var diag: String = ""
         private set
 
     val numberOfBands: Int
@@ -33,27 +36,37 @@ class EqualizerController {
 
     fun start() {
         error = null
+        val d = StringBuilder()
         try {
-            equalizer = Equalizer(0, 0)
+            equalizer = Equalizer(0, sessionId)
+            d.append("eq ok ctrl=").append(equalizer?.hasControl()).append("; ")
         } catch (t: Throwable) {
             error = t.message ?: "Equalizer unavailable"
             equalizer = null
+            d.append("eq ERR ").append(t.message).append("; ")
         }
         try {
-            enhancer = LoudnessEnhancer(0)
-        } catch (_: Throwable) {
+            enhancer = LoudnessEnhancer(sessionId)
+            d.append("enh ok ctrl=").append(enhancer?.hasControl()).append("; ")
+        } catch (t: Throwable) {
             enhancer = null
+            d.append("enh ERR ").append(t.message).append("; ")
         }
         try {
-            bassBoost = BassBoost(0, 0)
-        } catch (_: Throwable) {
+            bassBoost = BassBoost(0, sessionId)
+            d.append("bass ok ctrl=").append(bassBoost?.hasControl()).append("; ")
+        } catch (t: Throwable) {
             bassBoost = null
+            d.append("bass ERR ").append(t.message).append("; ")
         }
         try {
-            virtualizer = Virtualizer(0, 0)
-        } catch (_: Throwable) {
+            virtualizer = Virtualizer(0, sessionId)
+            d.append("virt ok ctrl=").append(virtualizer?.hasControl()).append("; ")
+        } catch (t: Throwable) {
             virtualizer = null
+            d.append("virt ERR ").append(t.message).append("; ")
         }
+        diag = "s$sessionId: $d"
     }
 
     fun restart(): Boolean {
@@ -63,10 +76,32 @@ class EqualizerController {
     }
 
     fun setEnabled(enabled: Boolean) {
-        try { equalizer?.enabled = enabled } catch (_: Throwable) {}
-        try { bassBoost?.enabled = enabled } catch (_: Throwable) {}
-        try { virtualizer?.enabled = enabled } catch (_: Throwable) {}
-        try { enhancer?.enabled = enabled } catch (_: Throwable) {}
+        val d = StringBuilder()
+        try {
+            equalizer?.enabled = enabled
+            d.append("eq=").append(equalizer?.enabled)
+        } catch (t: Throwable) {
+            d.append("eq=E")
+        }
+        try {
+            bassBoost?.enabled = enabled
+            d.append(" bass=").append(bassBoost?.enabled)
+        } catch (t: Throwable) {
+            d.append(" bass=E")
+        }
+        try {
+            virtualizer?.enabled = enabled
+            d.append(" virt=").append(virtualizer?.enabled)
+        } catch (t: Throwable) {
+            d.append(" virt=E")
+        }
+        try {
+            enhancer?.enabled = enabled
+            d.append(" enh=").append(enhancer?.enabled)
+        } catch (t: Throwable) {
+            d.append(" enh=E")
+        }
+        diag = diag.substringBefore(" set{") + " set{" + d.toString() + " }"
     }
 
     fun getBandLevel(band: Int): Short =
