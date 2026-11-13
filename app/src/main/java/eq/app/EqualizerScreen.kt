@@ -169,7 +169,7 @@ private fun MasterCard(onSetEnabled: (Boolean) -> Unit) {
             }
             Switch(
                 checked = EqEngine.enabled,
-                onCheckedChange = { onSetEnabled }
+                onCheckedChange = onSetEnabled
             )
         }
     }
