@@ -68,6 +68,7 @@ object EqEngine {
     private var sessionReceiver: BroadcastReceiver? = null
     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
     private var sessionReflectionOk = true
+    private var lastBroadcast = ""
 
     private val restartRunnable = Runnable { restartEffects() }
 
@@ -97,10 +98,13 @@ object EqEngine {
         registerDeviceCallback(appContext)
         registerSessionReceiver(appContext)
         registerPlaybackCallback(appContext)
+        if (sessionControllers.isNotEmpty()) {
+            for (sc in sessionControllers.values) applyToController(sc, enabled)
+            if (enabled) c.setEnabled(false)
+        }
         if (enabled) {
             startService(appContext)
             attachToActiveSessions()
-            if (sessionControllers.isNotEmpty()) c.setEnabled(false)
         }
         updateDiag()
     }
@@ -192,7 +196,8 @@ object EqEngine {
         val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
         val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "?"
         val open = intent.action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION
-        log("broadcast open=$open session=$sessionId pkg=$pkg")
+        lastBroadcast = "${if (open) "OPEN" else "CLOSE"} pkg=$pkg s=$sessionId"
+        log("broadcast $lastBroadcast")
         if (sessionId <= 0) return
         if (open) {
             attachSession(sessionId)
@@ -205,6 +210,17 @@ object EqEngine {
                 controller?.setEnabled(true)
             }
         }
+        updateDiag()
+    }
+
+    fun attachFromIntent(intent: Intent?) {
+        if (intent == null) return
+        val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
+        val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "?"
+        if (sessionId <= 0) return
+        log("panel intent session=$sessionId pkg=$pkg")
+        attachSession(sessionId)
+        if (enabled && sessionControllers.isNotEmpty()) controller?.setEnabled(false)
         updateDiag()
     }
 
@@ -285,7 +301,9 @@ object EqEngine {
         val parts = mutableListOf<String>()
         controller?.let { parts.add(it.diag) }
         for ((sid, sc) in sessionControllers) parts.add("s$sid: ${sc.diag}")
-        diag = parts.joinToString(" | ")
+        val scan = if (sessionReflectionOk) "scan=ok" else "scan=blocked"
+        val lb = if (lastBroadcast.isNotEmpty()) " last=[$lastBroadcast]" else ""
+        diag = parts.joinToString(" | ") + " | $scan$lb"
         log("diag: $diag")
     }
 
