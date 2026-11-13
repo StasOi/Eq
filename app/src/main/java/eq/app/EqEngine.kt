@@ -4,6 +4,11 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +53,11 @@ object EqEngine {
 
     private var controller: EqualizerController? = null
     private var prefs: EqPrefs? = null
+    private var appContext: Context? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var restartAttempts = 0
+
+    private val restartRunnable = Runnable { restartEffects() }
 
     val error: String?
         get() = controller?.error
@@ -58,40 +68,115 @@ object EqEngine {
     fun start(context: Context) {
         if (controller != null) return
         val appContext = context.applicationContext
+        this.appContext = appContext
         val p = EqPrefs(appContext)
         prefs = p
         val c = EqualizerController()
         c.start()
         controller = c
         if (c.error == null && c.numberOfBands > 0) {
-            bands = c.numberOfBands
-            freqs = c.centerFreqs
-            range = c.bandLevelRange
-            levels = p.loadBandLevels(bands).let { saved ->
-                ShortArray(bands) { i -> saved[i].coerceIn(range[0], range[1]) }
-            }
-            boost = p.loadBoost()
-            bass = p.loadBass()
-            virtual = p.loadVirtual()
-            preset = p.loadPreset()
-            enabled = p.loadEnabled()
-            for (i in 0 until bands) c.setBandLevel(i, levels[i])
-            c.setBoost(boost)
-            c.setBassStrength(bass)
-            c.setVirtualStrength(virtual)
-            c.setEnabled(enabled)
-            boostAvailable = c.isBoostAvailable()
-            bassAvailable = c.isBassAvailable()
-            virtualAvailable = c.isVirtualAvailable()
+            loadFromPrefs(c)
+            applyToController(c)
             ready = true
-            if (p.loadVisualizer() &&
-                ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED
-            ) {
+            if (p.loadVisualizer() && hasAudioPermission()) {
                 setVisualizer(appContext, true)
             }
         }
+        registerDeviceCallback(appContext)
         if (enabled) startService(appContext)
+    }
+
+    private fun loadFromPrefs(c: EqualizerController) {
+        val p = prefs ?: return
+        bands = c.numberOfBands
+        freqs = c.centerFreqs
+        range = c.bandLevelRange
+        levels = p.loadBandLevels(bands).let { saved ->
+            ShortArray(bands) { i -> saved[i].coerceIn(range[0], range[1]) }
+        }
+        boost = p.loadBoost()
+        bass = p.loadBass()
+        virtual = p.loadVirtual()
+        preset = p.loadPreset()
+        enabled = p.loadEnabled()
+    }
+
+    private fun applyToController(c: EqualizerController) {
+        for (i in 0 until bands) c.setBandLevel(i, levels[i])
+        c.setBoost(boost)
+        c.setBassStrength(bass)
+        c.setVirtualStrength(virtual)
+        c.setEnabled(enabled)
+        boostAvailable = c.isBoostAvailable()
+        bassAvailable = c.isBassAvailable()
+        virtualAvailable = c.isVirtualAvailable()
+    }
+
+    private fun hasAudioPermission(): Boolean {
+        val ctx = appContext ?: return false
+        return ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun registerDeviceCallback(context: Context) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val callback = object : AudioDeviceCallback() {
+            private var initialSyncDone = false
+
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                if (!initialSyncDone) {
+                    initialSyncDone = true
+                    return
+                }
+                if (addedDevices.any { it.isSink }) scheduleRestart()
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                if (removedDevices.any { it.isSink }) scheduleRestart()
+            }
+        }
+        am.registerAudioDeviceCallback(callback, handler)
+    }
+
+    private fun scheduleRestart() {
+        restartAttempts = 0
+        handler.removeCallbacks(restartRunnable)
+        handler.postDelayed(restartRunnable, RESTART_DELAY_MS)
+    }
+
+    private fun restartEffects() {
+        val c = controller ?: return
+        if (!c.restart()) {
+            if (restartAttempts < RESTART_MAX_ATTEMPTS) {
+                restartAttempts++
+                handler.postDelayed(restartRunnable, RESTART_RETRY_DELAY_MS)
+            }
+            return
+        }
+        restartAttempts = 0
+        if (!ready) {
+            loadFromPrefs(c)
+        } else {
+            bands = c.numberOfBands
+            freqs = c.centerFreqs
+            range = c.bandLevelRange
+            levels = ShortArray(bands) { i -> levels.getOrElse(i) { 0 }.coerceIn(range[0], range[1]) }
+        }
+        applyToController(c)
+        ready = true
+        if (visualizerActive) {
+            val ctx = appContext
+            if (ctx != null && hasAudioPermission()) {
+                setVisualizer(ctx, true)
+            } else {
+                visualizerActive = false
+                waveform = ByteArray(0)
+                prefs?.saveVisualizer(false)
+            }
+        }
+        if (enabled) {
+            appContext?.let { startService(it) }
+        }
     }
 
     fun setEnabled(context: Context, value: Boolean) {
@@ -179,6 +264,10 @@ object EqEngine {
     private fun startService(context: Context) {
         ContextCompat.startForegroundService(context, Intent(context, EqService::class.java))
     }
+
+    private const val RESTART_DELAY_MS = 600L
+    private const val RESTART_RETRY_DELAY_MS = 2000L
+    private const val RESTART_MAX_ATTEMPTS = 3
 
     private val PRESET_CURVES: Map<String, FloatArray> = mapOf(
         "Flat" to floatArrayOf(0f, 0f, 0f, 0f, 0f),

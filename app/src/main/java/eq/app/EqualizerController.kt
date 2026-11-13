@@ -32,6 +32,7 @@ class EqualizerController {
         }
 
     fun start() {
+        error = null
         try {
             equalizer = Equalizer(0, 0)
         } catch (t: Throwable) {
@@ -53,6 +54,12 @@ class EqualizerController {
         } catch (_: Throwable) {
             virtualizer = null
         }
+    }
+
+    fun restart(): Boolean {
+        release()
+        start()
+        return error == null && numberOfBands > 0
     }
 
     fun setEnabled(enabled: Boolean) {
