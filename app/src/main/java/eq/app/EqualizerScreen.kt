@@ -1,8 +1,11 @@
 package eq.app
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -10,66 +13,56 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BrightnessAuto
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material3.Card
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import eq.app.ui.theme.EqTheme
+import kotlin.math.abs
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun EqualizerScreen() {
-    EqTheme {
-        val context = androidx.compose.ui.platform.LocalContext.current
-        val controller = remember { EqualizerController() }
-        val prefs = remember { EqPrefs(context) }
+fun EqualizerScreen(
+    themeMode: String,
+    onThemeChange: (String) -> Unit,
+    onVisualizerPermission: () -> Unit
+) {
+    EqTheme(themeMode) {
+        val context = LocalContext.current
 
-        var bands by remember { mutableStateOf(0) }
-        var freqs by remember { mutableStateOf(IntArray(0)) }
-        var range by remember { mutableStateOf(shortArrayOf(-1500, 1500)) }
-        var levels by remember { mutableStateOf(ShortArray(0)) }
-        var boost by remember { mutableIntStateOf(0) }
-        var enabled by remember { mutableStateOf(true) }
-        var initialized by remember { mutableStateOf(false) }
-
-        androidx.compose.runtime.LaunchedEffect(Unit) {
-            controller.start()
-            if (controller.error == null && controller.numberOfBands > 0) {
-                bands = controller.numberOfBands
-                freqs = controller.centerFreqs
-                range = controller.bandLevelRange
-                levels = prefs.loadBandLevels(bands).let { saved ->
-                    ShortArray(bands) { i -> saved[i].coerceIn(range[0], range[1]) }
-                }
-                boost = prefs.loadBoost()
-                enabled = prefs.loadEnabled()
-                for (i in 0 until bands) controller.setBandLevel(i, levels[i])
-                controller.setBoost(boost)
-                controller.setEnabled(enabled)
-                initialized = true
-            }
-        }
-
-        androidx.compose.runtime.DisposableEffect(Unit) {
-            onDispose { controller.release() }
+        LaunchedEffect(Unit) {
+            EqEngine.start(context)
         }
 
         Scaffold(
             topBar = {
-                CenterAlignedTopAppBar(title = { Text("Eq — Эквалайзер") })
+                CenterAlignedTopAppBar(
+                    title = { Text("Eq — Эквалайзер") },
+                    actions = {
+                        IconButton(onClick = { onThemeChange(nextTheme(themeMode)) }) {
+                            Icon(themeIcon(themeMode), contentDescription = "Тема")
+                        }
+                    }
+                )
             }
         ) { padding ->
             Column(
@@ -80,7 +73,7 @@ fun EqualizerScreen() {
                     .padding(horizontal = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                val error = controller.error
+                val error = EqEngine.error
                 if (error != null) {
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp)) {
@@ -93,62 +86,68 @@ fun EqualizerScreen() {
                             Text(error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
                         }
                     }
-                } else if (initialized && bands > 0) {
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Включено", style = MaterialTheme.typography.titleMedium)
-                                Text("Глобальный системный эквалайзер", style = MaterialTheme.typography.bodySmall)
-                            }
-                            Switch(
-                                checked = enabled,
-                                onCheckedChange = {
-                                    enabled = it
-                                    controller.setEnabled(it)
-                                    prefs.saveEnabled(it)
-                                }
+                } else if (!EqEngine.ready) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("Загрузка…")
+                    }
+                } else {
+                    val onSetEnabled: (Boolean) -> Unit = { EqEngine.setEnabled(context, it) }
+                    MasterCard(onSetEnabled)
+
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        EqEngine.presetNames.forEach { name ->
+                            FilterChip(
+                                selected = EqEngine.preset == name,
+                                onClick = { EqEngine.applyPreset(name) },
+                                label = { Text(name) }
                             )
                         }
                     }
 
-                    for (i in 0 until bands) {
-                        BandRow(
-                            freqHz = freqs.getOrElse(i) { 0 },
-                            minLevel = range[0].toInt(),
-                            maxLevel = range[1].toInt(),
-                            level = levels[i].toInt(),
-                            onChange = { value ->
-                                levels[i] = value.toShort()
-                                controller.setBandLevel(i, value.toShort())
-                                prefs.saveBandLevel(i, value.toShort())
-                            }
+                    for (i in 0 until EqEngine.bands) {
+                        SliderRow(
+                            label = freqLabel(EqEngine.freqs.getOrElse(i) { 0 }),
+                            valueText = "${EqEngine.levels[i].toInt()} мБ",
+                            value = EqEngine.levels[i].toInt().toFloat(),
+                            range = EqEngine.range[0].toFloat()..EqEngine.range[1].toFloat(),
+                            onChange = { EqEngine.setBandLevel(i, it.toShort()) }
                         )
                     }
 
-                    if (controller.isBoostAvailable()) {
-                        BoostRow(
-                            boost = boost,
-                            onChange = { value ->
-                                boost = value
-                                controller.setBoost(value)
-                                prefs.saveBoost(value)
-                            }
-                        )
-                    } else {
-                        Text(
-                            "Общее усиление громкости не поддерживается устройством",
-                            style = MaterialTheme.typography.bodySmall
+                    if (EqEngine.boostAvailable) {
+                        SliderRow(
+                            label = "Общее усиление",
+                            valueText = "${"%.1f".format(EqEngine.boost / 1000f)} дБ",
+                            value = EqEngine.boost.toFloat(),
+                            range = 0f..15000f,
+                            onChange = { EqEngine.updateBoost(it) }
                         )
                     }
-                } else {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Загрузка…")
+
+                    if (EqEngine.bassAvailable) {
+                        SliderRow(
+                            label = "Bass Boost",
+                            valueText = "${EqEngine.bass} %",
+                            value = EqEngine.bass.toFloat(),
+                            range = 0f..100f,
+                            onChange = { EqEngine.updateBass(it) }
+                        )
                     }
+
+                    if (EqEngine.virtualAvailable) {
+                        SliderRow(
+                            label = "Virtualizer",
+                            valueText = "${EqEngine.virtual} %",
+                            value = EqEngine.virtual.toFloat(),
+                            range = 0f..100f,
+                            onChange = { EqEngine.updateVirtual(it) }
+                        )
+                    }
+
+                    VisualizerCard(onVisualizerPermission)
                 }
             }
         }
@@ -156,23 +155,44 @@ fun EqualizerScreen() {
 }
 
 @Composable
-private fun BandRow(
-    freqHz: Int,
-    minLevel: Int,
-    maxLevel: Int,
-    level: Int,
+private fun MasterCard(onSetEnabled: (Boolean) -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Включено", style = MaterialTheme.typography.titleMedium)
+                Text("Глобальный системный эквалайзер", style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(
+                checked = EqEngine.enabled,
+                onCheckedChange = { onSetEnabled }
+            )
+        }
+    }
+}
+
+@Composable
+private fun SliderRow(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
     onChange: (Int) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(modifier = Modifier.fillMaxWidth()) {
-            Text(freqLabel(freqHz), style = MaterialTheme.typography.labelMedium)
+            Text(label, style = MaterialTheme.typography.labelMedium)
             Box(modifier = Modifier.weight(1f))
-            Text("$level мБ", style = MaterialTheme.typography.labelMedium)
+            Text(valueText, style = MaterialTheme.typography.labelMedium)
         }
         Slider(
-            value = level.toFloat(),
+            value = value,
             onValueChange = { onChange(it.toInt()) },
-            valueRange = minLevel.toFloat()..maxLevel.toFloat(),
+            valueRange = range,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(32.dp)
@@ -181,25 +201,76 @@ private fun BandRow(
 }
 
 @Composable
-private fun BoostRow(
-    boost: Int,
-    onChange: (Int) -> Unit
-) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Row(modifier = Modifier.fillMaxWidth()) {
-            Text("Общее усиление", style = MaterialTheme.typography.labelMedium)
-            Box(modifier = Modifier.weight(1f))
-            Text("${"%.1f".format(boost / 1000f)} дБ", style = MaterialTheme.typography.labelMedium)
+private fun VisualizerCard(onVisualizerPermission: () -> Unit) {
+    val context = LocalContext.current
+    val primary = MaterialTheme.colorScheme.primary
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Визуализация", style = MaterialTheme.typography.titleMedium)
+                    Text("Уровень сигнала в реальном времени", style = MaterialTheme.typography.bodySmall)
+                }
+                Switch(
+                    checked = EqEngine.visualizerActive,
+                    onCheckedChange = { want ->
+                        if (want) {
+                            onVisualizerPermission()
+                        } else {
+                            EqEngine.setVisualizer(context, false)
+                        }
+                    }
+                )
+            }
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(96.dp)
+                    .padding(top = 8.dp)
+            ) {
+                val data = EqEngine.waveform
+                val barCount = 48
+                val gap = 2.dp.toPx()
+                val barWidth = (size.width - gap * (barCount - 1)) / barCount
+                for (b in 0 until barCount) {
+                    val amp = if (data.isEmpty()) 0f else {
+                        val start = b * data.size / barCount
+                        val end = (((b + 1) * data.size / barCount).coerceAtMost(data.size))
+                        var peak = 0
+                        for (j in start until end) {
+                            val v = abs((data[j].toInt() and 0xFF) - 128)
+                            if (v > peak) peak = v
+                        }
+                        peak / 128f
+                    }
+                    val h = (amp * size.height).coerceAtLeast(2.dp.toPx())
+                    val x = b * (barWidth + gap)
+                    drawLine(
+                        color = primary,
+                        start = Offset(x + barWidth / 2, size.height),
+                        end = Offset(x + barWidth / 2, size.height - h),
+                        strokeWidth = barWidth,
+                        cap = StrokeCap.Round
+                    )
+                }
+            }
         }
-        Slider(
-            value = boost.toFloat(),
-            onValueChange = { onChange(it.toInt()) },
-            valueRange = 0f..15000f,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(32.dp)
-        )
     }
+}
+
+private fun nextTheme(mode: String): String = when (mode) {
+    EqPrefs.THEME_SYSTEM -> EqPrefs.THEME_LIGHT
+    EqPrefs.THEME_LIGHT -> EqPrefs.THEME_DARK
+    else -> EqPrefs.THEME_SYSTEM
+}
+
+private fun themeIcon(mode: String) = when (mode) {
+    EqPrefs.THEME_LIGHT -> Icons.Filled.LightMode
+    EqPrefs.THEME_DARK -> Icons.Filled.DarkMode
+    else -> Icons.Filled.BrightnessAuto
 }
 
 private fun freqLabel(hz: Int): String = when {
@@ -207,4 +278,3 @@ private fun freqLabel(hz: Int): String = when {
     hz < 1000 -> "$hz Гц"
     else -> "${"%.1f".format(hz / 1000f)} кГц"
 }
-

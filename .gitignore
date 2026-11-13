@@ -10,3 +10,6 @@
 local.properties
 app/build
 .kotlin
+keystore.properties
+keystore/
+*.jks
