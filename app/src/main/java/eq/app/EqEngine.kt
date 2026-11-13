@@ -69,6 +69,7 @@ object EqEngine {
     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
     private var sessionReflectionOk = true
     private var lastBroadcast = ""
+    private var visualizerWanted = false
 
     private val restartRunnable = Runnable { restartEffects() }
 
@@ -91,8 +92,9 @@ object EqEngine {
             loadFromPrefs(c)
             applyToController(c, enabled)
             ready = true
-            if (p.loadVisualizer() && hasAudioPermission()) {
-                setVisualizer(appContext, true)
+            visualizerWanted = p.loadVisualizer()
+            if (visualizerWanted && hasAudioPermission()) {
+                syncVisualizer()
             }
         }
         registerDeviceCallback(appContext)
@@ -235,12 +237,14 @@ object EqEngine {
         }
         sessionControllers[sessionId] = sc
         applyToController(sc, enabled)
+        syncVisualizer()
         log("attached session=$sessionId bands=${sc.numberOfBands}")
     }
 
     private fun detachSession(sessionId: Int) {
         val sc = sessionControllers.remove(sessionId) ?: return
         sc.release()
+        syncVisualizer()
         log("detached session=$sessionId remaining=${sessionControllers.size}")
     }
 
@@ -300,7 +304,7 @@ object EqEngine {
     private fun updateDiag() {
         val parts = mutableListOf<String>()
         controller?.let { parts.add(it.diag) }
-        for ((sid, sc) in sessionControllers) parts.add("s$sid: ${sc.diag}")
+        for (sc in sessionControllers.values) parts.add(sc.diag)
         val scan = if (sessionReflectionOk) "scan=ok" else "scan=blocked"
         val lb = if (lastBroadcast.isNotEmpty()) " last=[$lastBroadcast]" else ""
         diag = parts.joinToString(" | ") + " | $scan$lb"
@@ -337,10 +341,9 @@ object EqEngine {
         }
         applyToController(c, enabled && sessionControllers.isEmpty())
         ready = true
-        if (visualizerActive) {
-            val ctx = appContext
-            if (ctx != null && hasAudioPermission()) {
-                setVisualizer(ctx, true)
+        if (visualizerWanted) {
+            if (hasAudioPermission()) {
+                syncVisualizer()
             } else {
                 visualizerActive = false
                 waveform = ByteArray(0)
@@ -413,15 +416,25 @@ object EqEngine {
     }
 
     fun setVisualizer(context: Context, active: Boolean) {
+        visualizerWanted = active
         if (active) {
-            val c = controller ?: return
-            visualizerActive = c.startVisualizer { w -> waveform = w }
+            syncVisualizer()
         } else {
             controller?.stopVisualizer()
+            for (sc in sessionControllers.values) sc.stopVisualizer()
             visualizerActive = false
             waveform = ByteArray(0)
+            prefs?.saveVisualizer(false)
         }
-        prefs?.saveVisualizer(active && visualizerActive)
+    }
+
+    private fun syncVisualizer() {
+        if (!visualizerWanted) return
+        controller?.stopVisualizer()
+        for (sc in sessionControllers.values) sc.stopVisualizer()
+        val target = sessionControllers.values.firstOrNull() ?: controller
+        visualizerActive = target?.startVisualizer { w -> waveform = w } ?: false
+        prefs?.saveVisualizer(visualizerWanted && visualizerActive)
     }
 
     fun presetGains(name: String, bandCount: Int, bandRange: ShortArray): ShortArray {
